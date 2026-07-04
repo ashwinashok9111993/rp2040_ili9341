@@ -2,7 +2,6 @@
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
-#include "hardware/irq.h"
 #include "ili9341_8080.pio.h"
 #include "lvgl.h"
 #include "demos/widgets/lv_demo_widgets.h"
@@ -34,8 +33,7 @@
 
 // ---------- globals ----------
 
-static uint32_t swap_buf[LV_HOR_RES_MAX * 10];  // 2400 words = 9600 B (packs 2 pixels/word)
-static lv_disp_drv_t *disp_drv_ref;
+static uint32_t swap_buf[LV_HOR_RES_MAX * 10];
 static uint program_offset;
 static dma_channel_config dma_cfg;
 
@@ -67,22 +65,6 @@ static void set_addr_win(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
 
     write_cmd_sync(0x2C);
     gpio_put(DC_PIN, 1);
-}
-
-// ---------- DMA ISR ----------
-
-static void dma_irq_handler(void) {
-    if (dma_hw->ints0 & (1u << DMA_CHAN)) {
-        dma_hw->ints0 = (1u << DMA_CHAN);
-        gpio_put(25, 1);
-        while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0)
-            tight_loop_contents();
-        for (volatile int i = 0; i < 8; i++)
-            tight_loop_contents();
-        ili9341_8080_switch_byte(DISPLAY_PIO, DISPLAY_SM, program_offset);
-        lv_disp_flush_ready(disp_drv_ref);
-        gpio_put(25, 0);
-    }
 }
 
 // ---------- ILI9341 init ----------
@@ -150,26 +132,21 @@ static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *co
 
     set_addr_win(area->x1, area->y1, area->x2, area->y2);
 
-    // Pack 2 pixels per uint32_t with bytes in HI0,LO0,HI1,LO1 order.
-    // PIO shift_right: out pins,8 outputs bits[7:0] first = HI0
+    // Pack 2 pixels per uint32_t: HI0,LO0,HI1,LO1 (PIO shift_right sends bits[7:0] first)
     uint8_t *b = (uint8_t *)color_p;
     uint32_t pairs = n / 2;
-    uint32_t i;
-    for (i = 0; i < pairs; i++) {
-        swap_buf[i] = b[i * 4 + 1]                     // HI0
-                    | ((uint32_t)b[i * 4 + 0] << 8)     // LO0
-                    | ((uint32_t)b[i * 4 + 3] << 16)    // HI1
-                    | ((uint32_t)b[i * 4 + 2] << 24);   // LO1
+    for (uint32_t i = 0; i < pairs; i++) {
+        swap_buf[i] = b[i * 4 + 1]
+                    | ((uint32_t)b[i * 4 + 0] << 8)
+                    | ((uint32_t)b[i * 4 + 3] << 16)
+                    | ((uint32_t)b[i * 4 + 2] << 24);
     }
 
-    // Odd pixel: pack a partial word; ILI9341 ignores extra writes past window
     uint32_t dma_words = pairs;
     if (n & 1) {
-        swap_buf[i] = b[n * 2 - 1] | ((uint32_t)b[n * 2 - 2] << 8);
+        swap_buf[pairs] = b[n * 2 - 1] | ((uint32_t)b[n * 2 - 2] << 8);
         dma_words = pairs + 1;
     }
-
-    disp_drv_ref = drv;
 
     ili9341_8080_switch_dma(DISPLAY_PIO, DISPLAY_SM, program_offset);
     dma_channel_abort(DMA_CHAN);
@@ -178,6 +155,21 @@ static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *co
         &pio0_hw->txf[DISPLAY_SM],
         swap_buf, dma_words, true
     );
+
+    // Wait for DMA completion synchronously
+    while (dma_channel_is_busy(DMA_CHAN))
+        tight_loop_contents();
+
+    // Drain TX FIFO
+    while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0)
+        tight_loop_contents();
+
+    // Drain OSR
+    for (volatile int i = 0; i < 8; i++)
+        tight_loop_contents();
+
+    ili9341_8080_switch_byte(DISPLAY_PIO, DISPLAY_SM, program_offset);
+    lv_disp_flush_ready(drv);
 }
 
 // ---------- LVGL 5 ms tick ----------
@@ -220,11 +212,6 @@ int main(void) {
         &pio0_hw->txf[DISPLAY_SM],
         NULL, 0, false
     );
-
-    dma_hw->ints0 = (1u << DMA_CHAN);
-    dma_channel_set_irq0_enabled(DMA_CHAN, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
-    irq_set_enabled(DMA_IRQ_0, true);
 
     // ---- Display ----
     ili9341_init();
