@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "pico/stdlib.h"
@@ -124,10 +125,9 @@ static void ili9341_init(void) {
     write_cmd(0x29); sleep_ms(50);
 }
 
-// ---------- 3D cube ----------
+// ---------- Dice demo ----------
 
-// ---- 3D rotating cube --------------------------------------------------
-#define CUBE_SCALE 130
+#define DICE_SCALE 90
 
 static const int8_t cube_verts[8][3] = {
     {-1,-1,-1},{ 1,-1,-1},{ 1, 1,-1},{-1, 1,-1},
@@ -139,13 +139,36 @@ static const uint8_t cube_faces[6][4] = {
     {3,2,6,7},{4,0,3,7},{1,5,6,2},
 };
 
-static const uint16_t face_colors[6] = {
-    0xF800,0x001F,0x07E0,0xFFE0,0x07FF,0xF81F,
-};
-
 static const int8_t face_norms[6][3] = {
     {0,0,-1},{0,0,1},{0,-1,0},
     {0,1,0},{-1,0,0},{1,0,0},
+};
+
+// Face index → die value (opposite sum to 7)
+static const uint8_t face_val[] = {2, 5, 1, 6, 4, 3};
+
+// Dot UVs (in 0..8) for each die value 1..6
+static const uint8_t dots_1[] = {4,4};
+static const uint8_t dots_2[] = {2,2, 6,6};
+static const uint8_t dots_3[] = {2,2, 4,4, 6,6};
+static const uint8_t dots_4[] = {2,2, 6,2, 2,6, 6,6};
+static const uint8_t dots_5[] = {2,2, 6,2, 4,4, 2,6, 6,6};
+static const uint8_t dots_6[] = {2,1, 6,1, 2,4, 6,4, 2,7, 6,7};
+static const uint8_t *dot_data[] = {dots_1, dots_2, dots_3, dots_4, dots_5, dots_6};
+static const uint8_t dot_cnt[] = {1, 2, 3, 4, 5, 6};
+
+// 5x7 bitmap font for digits 0-9 (readable when scaled 4x)
+static const uint8_t dig_font[10][7] = {
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
+    {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E},
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+    {0x0E,0x10,0x1E,0x11,0x11,0x11,0x0E},
+    {0x1F,0x01,0x02,0x04,0x04,0x04,0x04},
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
+    {0x0E,0x11,0x11,0x0F,0x01,0x11,0x0E},
 };
 
 // Q16.16 fixed-point trig
@@ -166,13 +189,16 @@ static inline int32_t fp_mul(int32_t a, int32_t b) {
 
 // Per-frame state
 static int16_t sx[8], sy[8], sz[8];
-static int16_t face_rz[6];   // face center Z for depth sort
-static uint8_t face_vis[6];  // visible flag
-static uint8_t face_bright[6];
 static int32_t ang_x, ang_y;
 
+// Dice animation state
+enum { ROLL, SETTLE, SHOW } state = ROLL;
+static int32_t vel_x, vel_y;
+static int timer;
+static int result;
+
 #define CX (TFT_W/2)
-#define CY (TFT_H/2) + 10
+#define CY (TFT_H/2)
 
 // ---- draw a horizontal span into fb ----
 static void fill_span(int y, int x0, int x1, uint16_t c) {
@@ -188,9 +214,25 @@ static void fill_span(int y, int x0, int x1, uint16_t c) {
     }
 }
 
+// ---- draw a filled circle ----
+static void fill_circle(int cx, int cy, int r, uint16_t col) {
+    uint8_t hi = col >> 8, lo = col & 0xFF;
+    for (int dy = -r; dy <= r; dy++) {
+        int y = cy + dy;
+        if (y < 0 || y >= TFT_H) continue;
+        int w = (int)(sqrtf(r * r - dy * dy));
+        int x0 = cx - w; if (x0 < 0) x0 = 0;
+        int x1 = cx + w; if (x1 >= TFT_W) x1 = TFT_W - 1;
+        if (x0 > x1) continue;
+        int base = (y * TFT_W + x0) * 2;
+        for (int x = x0; x <= x1; x++) {
+            fb[base] = hi; fb[base + 1] = lo; base += 2;
+        }
+    }
+}
+
 // ---- rasterize a single triangle ----
 static void fill_tri(int vx[3], int vy[3], uint16_t col) {
-    // Sort by Y (bubble)
     for (int k = 0; k < 2; k++)
         for (int j = 0; j < 2 - k; j++)
             if (vy[j] > vy[j+1]) {
@@ -201,14 +243,12 @@ static void fill_tri(int vx[3], int vy[3], uint16_t col) {
     int y0 = vy[0], y1 = vy[1], y2 = vy[2];
     if (y0 >= y2) return;
 
-    // Clip Y to screen
     int ys = y0 < 0 ? 0 : y0;
     int ye = y2 >= TFT_H ? TFT_H - 1 : y2;
     if (ys > ye) return;
 
     int cross = (vx[1]-vx[0])*(vy[2]-vy[0]) - (vy[1]-vy[0])*(vx[2]-vx[0]);
 
-    // ---- flat-top ----
     if (y0 == y1) {
         int xl = vx[0], xr = vx[1];
         if (xl > xr) { int t = xl; xl = xr; xr = t; }
@@ -223,7 +263,6 @@ static void fill_tri(int vx[3], int vy[3], uint16_t col) {
         return;
     }
 
-    // ---- flat-bottom ----
     if (y1 == y2) {
         int xl = vx[1], xr = vx[2];
         if (xl > xr) { int t = xl; xl = xr; xr = t; }
@@ -238,16 +277,12 @@ static void fill_tri(int vx[3], int vy[3], uint16_t col) {
         return;
     }
 
-    // ---- general case ----
     int dx_long = (vx[2] - vx[0]) * 65536 / (y2 - y0);
     int dx_short_top, dx_short_bot;
 
     if (cross >= 0) {
-        // middle LEFT → left=short(v0→v1→v2), right=long(v0→v2)
         dx_short_top = (vx[1] - vx[0]) * 65536 / (y1 - y0);
         dx_short_bot = (vx[2] - vx[1]) * 65536 / (y2 - y1);
-
-        // Top half
         int y_top_end = y1 < ye ? y1 : ye + 1;
         int fl = vx[0] * 65536 + dx_short_top * (ys - y0);
         int fr = vx[0] * 65536 + dx_long * (ys - y0);
@@ -255,8 +290,6 @@ static void fill_tri(int vx[3], int vy[3], uint16_t col) {
             fill_span(y, fl >> 16, fr >> 16, col);
             fl += dx_short_top; fr += dx_long;
         }
-
-        // Bottom half
         int yb = y1 > ys ? y1 : ys;
         if (yb <= ye) {
             fl = vx[1] * 65536 + dx_short_bot * (yb - y1);
@@ -267,11 +300,8 @@ static void fill_tri(int vx[3], int vy[3], uint16_t col) {
             }
         }
     } else {
-        // middle RIGHT → left=long(v0→v2), right=short(v0→v1→v2)
         dx_short_top = (vx[1] - vx[0]) * 65536 / (y1 - y0);
         dx_short_bot = (vx[2] - vx[1]) * 65536 / (y2 - y1);
-
-        // Top half
         int y_top_end = y1 < ye ? y1 : ye + 1;
         int fl = vx[0] * 65536 + dx_long * (ys - y0);
         int fr = vx[0] * 65536 + dx_short_top * (ys - y0);
@@ -279,8 +309,6 @@ static void fill_tri(int vx[3], int vy[3], uint16_t col) {
             fill_span(y, fl >> 16, fr >> 16, col);
             fl += dx_long; fr += dx_short_top;
         }
-
-        // Bottom half
         int yb = y1 > ys ? y1 : ys;
         if (yb <= ye) {
             fl = vx[0] * 65536 + dx_long * (yb - y0);
@@ -293,13 +321,13 @@ static void fill_tri(int vx[3], int vy[3], uint16_t col) {
     }
 }
 
+// ---- fill a die face quad with a color ----
 static void draw_face(int f, uint16_t col) {
     int px[4], py[4];
     for (int i = 0; i < 4; i++) {
         int vi = cube_faces[f][i];
         px[i] = sx[vi]; py[i] = sy[vi];
     }
-    // Split quad → two triangles (0,1,2) and (0,2,3)
     int vx[3], vy[3];
     vx[0]=px[0]; vy[0]=py[0]; vx[1]=px[1]; vy[1]=py[1]; vx[2]=px[2]; vy[2]=py[2];
     fill_tri(vx, vy, col);
@@ -307,10 +335,112 @@ static void draw_face(int f, uint16_t col) {
     fill_tri(vx, vy, col);
 }
 
+// ---- draw dots on a die face ----
+static void draw_dots_on_face(int f, uint16_t dot_col) {
+    int px[4], py[4];
+    for (int i = 0; i < 4; i++) {
+        int vi = cube_faces[f][i];
+        px[i] = sx[vi]; py[i] = sy[vi];
+    }
+
+    int val = face_val[f];
+    int n = dot_cnt[val - 1];
+    const uint8_t *uv = dot_data[val - 1];
+
+    for (int d = 0; d < n; d++) {
+        uint8_t u = uv[d * 2];
+        uint8_t v = uv[d * 2 + 1];
+        int x = ((8 - u) * (8 - v) * px[0] + u * (8 - v) * px[1]
+               + (8 - u) * v * px[3] + u * v * px[2]) >> 6;
+        int y = ((8 - u) * (8 - v) * py[0] + u * (8 - v) * py[1]
+               + (8 - u) * v * py[3] + u * v * py[2]) >> 6;
+        fill_circle(x, y, 3, dot_col);
+    }
+}
+
+// ---- draw a digit at (x,y) with scale factor ----
+static void draw_digit(int x, int y, int d, int scale, uint16_t col) {
+    uint8_t hi = col >> 8, lo = col & 0xFF;
+    for (int row = 0; row < 7; row++) {
+        uint8_t bits = dig_font[d][row];
+        for (int colb = 0; colb < 5; colb++) {
+            if (!(bits & (1 << (4 - colb)))) continue;
+            int xp = x + colb * scale;
+            int yp = y + row * scale;
+            for (int dy = 0; dy < scale; dy++) {
+                int yy = yp + dy;
+                if (yy < 0 || yy >= TFT_H) continue;
+                for (int dx = 0; dx < scale; dx++) {
+                    int xx = xp + dx;
+                    if (xx < 0 || xx >= TFT_W) continue;
+                    int i = (yy * TFT_W + xx) * 2;
+                    fb[i] = hi; fb[i + 1] = lo;
+                }
+            }
+        }
+    }
+}
+
+// ---- render one frame ----
 static void render_frame(void) {
     memset(fb, 0, sizeof(fb));
 
-    // Trig indices
+    // --- animation ---
+    switch (state) {
+    case ROLL:
+        ang_x += vel_x;
+        ang_y += vel_y;
+        vel_x += (int32_t)((rand() % 2000) - 1000);
+        vel_y += (int32_t)((rand() % 2000) - 1000);
+        vel_x = vel_x * 96 / 100;
+        vel_y = vel_y * 96 / 100;
+        timer++;
+        if (timer > 80) state = SETTLE;
+        break;
+    case SETTLE:
+        ang_x += vel_x;
+        ang_y += vel_y;
+        vel_x = vel_x * 88 / 100;
+        vel_y = vel_y * 88 / 100;
+        timer++;
+        if (vel_x < 0) vel_x = -vel_x;
+        if (vel_y < 0) vel_y = -vel_y;
+        if (vel_x < 100 && vel_y < 100) {
+            state = SHOW;
+            timer = 0;
+            // Determine which face faces camera most (+Z)
+            int ai = (ang_x >> (16-TRIG_BITS)) & (TRIG_SIZE-1);
+            int aj = (ai + TRIG_SIZE/4) & (TRIG_SIZE-1);
+            int32_t cx = trig_tab[ai], sx = trig_tab[aj];
+            ai = (ang_y >> (16-TRIG_BITS)) & (TRIG_SIZE-1);
+            aj = (ai + TRIG_SIZE/4) & (TRIG_SIZE-1);
+            int32_t cy = trig_tab[ai], sy = trig_tab[aj];
+            int best_f = 0;
+            int32_t best_nz = -999999;
+            for (int f = 0; f < 6; f++) {
+                int32_t nx = face_norms[f][0] * 65536;
+                int32_t ny = face_norms[f][1] * 65536;
+                int32_t nz = face_norms[f][2] * 65536;
+                int32_t rnz = fp_mul(nx, sy) + fp_mul(nz, cy);
+                nx = fp_mul(nx, cy) - fp_mul(nz, sy);
+                rnz = fp_mul(ny, sx) + fp_mul(rnz, cx);
+                if (rnz > best_nz) { best_nz = rnz; best_f = f; }
+            }
+            result = face_val[best_f];
+        }
+        break;
+    case SHOW:
+        timer++;
+        if (timer > 150) {
+            state = ROLL;
+            timer = 0;
+            vel_x = (int32_t)((rand() % 20000) - 10000);
+            vel_y = (int32_t)((rand() % 20000) - 10000);
+        }
+        break;
+    }
+
+    // --- 3D transform ---
     int ai = (ang_x >> (16-TRIG_BITS)) & (TRIG_SIZE-1);
     int aj = (ai + TRIG_SIZE/4) & (TRIG_SIZE-1);
     int32_t cos_x = trig_tab[ai], sin_x = trig_tab[aj];
@@ -318,60 +448,46 @@ static void render_frame(void) {
     aj = (ai + TRIG_SIZE/4) & (TRIG_SIZE-1);
     int32_t cos_y = trig_tab[ai], sin_y = trig_tab[aj];
 
-    int32_t sc = CUBE_SCALE * 65536;
-
-    // Rotate all 8 vertices
+    int32_t sc = DICE_SCALE * 65536;
     for (int i = 0; i < 8; i++) {
         int32_t x = cube_verts[i][0] * sc;
         int32_t y = cube_verts[i][1] * sc;
         int32_t z = cube_verts[i][2] * sc;
-
         int32_t rx = fp_mul(x, cos_y) - fp_mul(z, sin_y);
         int32_t rz = fp_mul(x, sin_y) + fp_mul(z, cos_y);
         x = rx; z = rz;
         int32_t ry = fp_mul(y, cos_x) - fp_mul(z, sin_x);
         rz = fp_mul(y, sin_x) + fp_mul(z, cos_x);
         y = ry; z = rz;
-
         sx[i] = CX + (int16_t)(x >> 16);
         sy[i] = CY + (int16_t)(y >> 16);
         sz[i] = (int16_t)(z >> 16);
     }
 
-    // Collect visible faces with brightness and depth
+    // --- collect visible faces ---
     int nf = 0;
     int vis_f[6], vis_b[6];
     int16_t vis_z[6];
-
     for (int f = 0; f < 6; f++) {
         int32_t nx = face_norms[f][0] * 65536;
         int32_t ny = face_norms[f][1] * 65536;
         int32_t nz = face_norms[f][2] * 65536;
-
         int32_t rnx = fp_mul(nx, cos_y) - fp_mul(nz, sin_y);
         int32_t rnz = fp_mul(nx, sin_y) + fp_mul(nz, cos_y);
         nx = rnx; nz = rnz;
         int32_t rny = fp_mul(ny, cos_x) - fp_mul(nz, sin_x);
         rnz = fp_mul(ny, sin_x) + fp_mul(nz, cos_x);
         ny = rny; nz = rnz;
-
-        // Back-face cull
         if (nz <= 0) continue;
-
-        // Diffuse shading
         int32_t dot = fp_mul(nx, 32768) + fp_mul(ny, 32768) + nz;
         if (dot < 0) dot = 0;
         if (dot > 65536) dot = 65536;
-
         vis_f[nf] = f;
         vis_b[nf] = (int)(dot >> 8);
-        // Face center Z (average of 4 vertices), larger = further
-        vis_z[nf] = (sz[cube_faces[f][0]]+sz[cube_faces[f][1]]+
-                     sz[cube_faces[f][2]]+sz[cube_faces[f][3]]);
+        vis_z[nf] = (sz[cube_faces[f][0]]+sz[cube_faces[f][1]]
+                    +sz[cube_faces[f][2]]+sz[cube_faces[f][3]]);
         nf++;
     }
-
-    // Sort visible faces by Z descending (painter's algorithm)
     for (int i = 0; i < nf-1; i++)
         for (int j = 0; j < nf-1-i; j++)
             if (vis_z[j] < vis_z[j+1]) {
@@ -380,41 +496,42 @@ static void render_frame(void) {
                 int tb = vis_b[j]; vis_b[j] = vis_b[j+1]; vis_b[j+1] = tb;
             }
 
-    // Draw faces back-to-front
+    // --- draw visible faces with dots ---
     for (int fi = 0; fi < nf; fi++) {
         int f = vis_f[fi];
-        int b = vis_b[fi] * 255 / 256;  // 0..255
+        int b = vis_b[fi] * 255 / 256;
         if (b < 8) continue;
+        // Die body color: cream white shaded by brightness
+        int v = 200 + b / 4;
+        if (v > 255) v = 255;
+        uint16_t body_col = ((v>>3)<<11)|((v>>2)<<5)|(v>>3);
+        draw_face(f, body_col);
+        draw_dots_on_face(f, 0x0000);
+    }
 
-        uint16_t bc = face_colors[f];
-        int r = ((bc>>11)&0x1F) * b / 255;
-        int g = ((bc>>5)&0x3F) * b / 255;
-        int bl = (bc&0x1F) * b / 255;
-        uint16_t col = ((r>>3)<<11)|((g>>2)<<5)|(bl>>3);
-
-        draw_face(f, col);
+    // --- draw result number ---
+    if (state == SHOW) {
+        int dig = result;
+        draw_digit(80, 270, dig, 8, 0xFFFF);
     }
 }
 
 // ---------- main ----------
-
 int main(void) {
     stdio_init_all();
     sleep_ms(100);
+    srand(12345);
 
-    // PIO
     program_offset = pio_add_program(DISPLAY_PIO, &ili9341_8080_program);
     ili9341_8080_program_init(DISPLAY_PIO, DISPLAY_SM, program_offset, DATA_BASE, WR_PIN);
     gpio_put(WR_PIN, 1);
     pio_sm_set_enabled(DISPLAY_PIO, DISPLAY_SM, true);
 
-    // GPIO
     gpio_init(RD_PIN);   gpio_set_dir(RD_PIN, GPIO_OUT);   gpio_put(RD_PIN, 1);
     gpio_init(DC_PIN);   gpio_set_dir(DC_PIN, GPIO_OUT);   gpio_put(DC_PIN, 0);
     gpio_init(CS_PIN);   gpio_set_dir(CS_PIN, GPIO_OUT);   gpio_put(CS_PIN, 0);
     gpio_init(RST_PIN);  gpio_set_dir(RST_PIN, GPIO_OUT);  gpio_put(RST_PIN, 1);
 
-    // DMA
     dma_cfg = dma_channel_get_default_config(DMA_CHAN);
     channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&dma_cfg, true);
@@ -422,39 +539,15 @@ int main(void) {
     channel_config_set_dreq(&dma_cfg, pio_get_dreq(DISPLAY_PIO, DISPLAY_SM, true));
     dma_channel_configure(DMA_CHAN, &dma_cfg, &pio0_hw->txf[DISPLAY_SM], NULL, 0, false);
 
-    // Display
     ili9341_init();
     init_trig();
 
-    // Show CPU-driven test rect
-    {
-        gpio_put(DC_PIN, 0);
-        pio_put(0x2A); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        gpio_put(DC_PIN, 1);
-        for (int i = 0; i < 4; i++) { pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0); }
-        pio_put(99); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        gpio_put(DC_PIN, 0);
-        pio_put(0x2B); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        gpio_put(DC_PIN, 1);
-        for (int i = 0; i < 4; i++) { pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0); }
-        pio_put(99); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        gpio_put(DC_PIN, 0);
-        pio_put(0x2C); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        gpio_put(DC_PIN, 1);
-        for (int px = 0; px < 100 * 100; px++) {
-            pio_put(0xF8); pio_put(0x00);
-        }
-        while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-    }
-
-    ang_x = 0;
-    ang_y = 0;
+    vel_x = (int32_t)((rand() % 20000) - 10000);
+    vel_y = (int32_t)((rand() % 20000) - 10000);
 
     for (;;) {
         render_frame();
         flush_fb();
-        ang_x += 786;  // ~0.012 rad per frame in Q16.16
-        ang_y += 524;
         gpio_put(25, 1);
         gpio_put(25, 0);
     }
