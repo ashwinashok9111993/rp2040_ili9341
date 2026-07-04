@@ -33,7 +33,6 @@
 
 // ---------- globals ----------
 
-static uint32_t swap_buf[LV_HOR_RES_MAX * 10];
 static uint program_offset;
 static dma_channel_config dma_cfg;
 
@@ -126,49 +125,22 @@ static void ili9341_init(void) {
 static lv_color_t buf[LV_HOR_RES_MAX * 10];
 
 static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t w = lv_area_get_width(area);
-    uint32_t h = lv_area_get_height(area);
-    uint32_t n = w * h;
+    uint32_t n = lv_area_get_width(area) * lv_area_get_height(area);
 
     set_addr_win(area->x1, area->y1, area->x2, area->y2);
 
-    // Pack 2 pixels per uint32_t: HI0,LO0,HI1,LO1 (PIO shift_right sends bits[7:0] first)
-    uint8_t *b = (uint8_t *)color_p;
-    uint32_t pairs = n / 2;
-    for (uint32_t i = 0; i < pairs; i++) {
-        swap_buf[i] = b[i * 4 + 1]
-                    | ((uint32_t)b[i * 4 + 0] << 8)
-                    | ((uint32_t)b[i * 4 + 3] << 16)
-                    | ((uint32_t)b[i * 4 + 2] << 24);
-    }
-
-    uint32_t dma_words = pairs;
-    if (n & 1) {
-        swap_buf[pairs] = b[n * 2 - 1] | ((uint32_t)b[n * 2 - 2] << 8);
-        dma_words = pairs + 1;
-    }
-
-    ili9341_8080_switch_dma(DISPLAY_PIO, DISPLAY_SM, program_offset);
-    dma_channel_abort(DMA_CHAN);
     dma_channel_configure(
         DMA_CHAN, &dma_cfg,
         &pio0_hw->txf[DISPLAY_SM],
-        swap_buf, dma_words, true
+        color_p, n * 2, true
     );
 
-    // Wait for DMA completion synchronously
     while (dma_channel_is_busy(DMA_CHAN))
         tight_loop_contents();
 
-    // Drain TX FIFO
     while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0)
         tight_loop_contents();
 
-    // Drain OSR
-    for (volatile int i = 0; i < 8; i++)
-        tight_loop_contents();
-
-    ili9341_8080_switch_byte(DISPLAY_PIO, DISPLAY_SM, program_offset);
     lv_disp_flush_ready(drv);
 }
 
@@ -202,7 +174,7 @@ int main(void) {
 
     // ---- DMA ----
     dma_cfg = dma_channel_get_default_config(DMA_CHAN);
-    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
+    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&dma_cfg, true);
     channel_config_set_write_increment(&dma_cfg, false);
     channel_config_set_dreq(&dma_cfg, pio_get_dreq(DISPLAY_PIO, DISPLAY_SM, true));
@@ -261,6 +233,6 @@ int main(void) {
 
     for (;;) {
         lv_timer_handler();
-        sleep_ms(5);
+        sleep_ms(1);
     }
 }
