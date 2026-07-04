@@ -1,0 +1,74 @@
+;
+; PIO program for ILI9341 8-bit 8080 parallel write interface.
+;
+; OUT pin mapping: 8 consecutive data pins (D0-D7)
+; SET pin mapping: WR strobe (active low)
+;
+; Two modes:
+;   byte_mode (default): one byte per pulled word via explicit pull block
+;   dma_mode:            four bytes per autopulled word (autopull must be enabled)
+;
+; DC/CS/RS control pins are handled as regular GPIO outside the PIO.
+;
+
+.program ili9341_8080
+.wrap_target                ; byte_mode entry (also program base)
+    pull block
+    out pins, 8 [1]
+    set pins, 0 [1]
+    set pins, 1 [1]
+.wrap
+
+dma_mode:
+    out pins, 8 [1]
+    set pins, 0 [1]
+    set pins, 1 [1]
+    out pins, 8 [1]
+    set pins, 0 [1]
+    set pins, 1 [1]
+    out pins, 8 [1]
+    set pins, 0 [1]
+    set pins, 1 [1]
+    out pins, 8 [1]
+    set pins, 0 [1]
+    set pins, 1 [1]
+    jmp dma_mode
+
+% c-sdk {
+
+#include "hardware/pio.h"
+
+static inline void ili9341_8080_program_init(PIO pio, uint sm, uint offset, uint data_base, uint wr_pin) {
+    for (int i = 0; i < 8; i++) {
+        pio_gpio_init(pio, data_base + i);
+    }
+    pio_gpio_init(pio, wr_pin);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, data_base, 8, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, wr_pin, 1, true);
+
+    pio_sm_config c = ili9341_8080_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, data_base, 8);
+    sm_config_set_set_pins(&c, wr_pin, 1);
+    sm_config_set_out_shift(&c, true, false, 1);    // shift right, no autopull; threshold=1 for DMA mode
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void ili9341_8080_switch_dma(PIO pio, uint sm, uint offset) {
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_restart(pio, sm);
+    hw_set_bits(&pio->sm[sm].shiftctrl, PIO_SM0_SHIFTCTRL_AUTOPULL_BITS);
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset + ili9341_8080_wrap + 1));
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void ili9341_8080_switch_byte(PIO pio, uint sm, uint offset) {
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_restart(pio, sm);
+    hw_clear_bits(&pio->sm[sm].shiftctrl, PIO_SM0_SHIFTCTRL_AUTOPULL_BITS);
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset));
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}

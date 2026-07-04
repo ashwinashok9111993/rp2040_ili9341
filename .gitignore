@@ -1,0 +1,10 @@
+build/
+*.o
+*.elf
+*.bin
+*.hex
+*.uf2
+*.dis
+*.map
+compile_commands.json
+_deps/
