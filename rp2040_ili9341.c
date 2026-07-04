@@ -127,7 +127,7 @@ static void ili9341_init(void) {
 
 // ---------- Dice demo ----------
 
-#define DICE_SCALE 90
+#define DICE_SCALE 65
 
 static const int8_t cube_verts[8][3] = {
     {-1,-1,-1},{ 1,-1,-1},{ 1, 1,-1},{-1, 1,-1},
@@ -211,6 +211,24 @@ static void fill_span(int y, int x0, int x1, uint16_t c) {
     int base = (y * TFT_W + x0) * 2;
     for (int x = x0; x <= x1; x++) {
         fb[base] = hi; fb[base+1] = lo; base += 2;
+    }
+}
+
+// ---- draw a line (Bresenham) ----
+static void draw_line(int x0, int y0, int x1, int y1, uint16_t col) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    uint8_t hi = col >> 8, lo = col & 0xFF;
+    for (;;) {
+        if (x0 >= 0 && x0 < TFT_W && y0 >= 0 && y0 < TFT_H) {
+            int i = (y0 * TFT_W + x0) * 2;
+            fb[i] = hi; fb[i+1] = lo;
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
     }
 }
 
@@ -354,8 +372,21 @@ static void draw_dots_on_face(int f, uint16_t dot_col) {
                + (8 - u) * v * px[3] + u * v * px[2]) >> 6;
         int y = ((8 - u) * (8 - v) * py[0] + u * (8 - v) * py[1]
                + (8 - u) * v * py[3] + u * v * py[2]) >> 6;
-        fill_circle(x, y, 3, dot_col);
+        fill_circle(x, y, 5, dot_col);
     }
+}
+
+// ---- outline a die face in black ----
+static void outline_face(int f, uint16_t col) {
+    int px[4], py[4];
+    for (int i = 0; i < 4; i++) {
+        int vi = cube_faces[f][i];
+        px[i] = sx[vi]; py[i] = sy[vi];
+    }
+    draw_line(px[0], py[0], px[1], py[1], col);
+    draw_line(px[1], py[1], px[2], py[2], col);
+    draw_line(px[2], py[2], px[3], py[3], col);
+    draw_line(px[3], py[3], px[0], py[0], col);
 }
 
 // ---- draw a digit at (x,y) with scale factor ----
@@ -496,17 +527,17 @@ static void render_frame(void) {
                 int tb = vis_b[j]; vis_b[j] = vis_b[j+1]; vis_b[j+1] = tb;
             }
 
-    // --- draw visible faces with dots ---
+    // --- draw visible faces with dots and outlines ---
     for (int fi = 0; fi < nf; fi++) {
         int f = vis_f[fi];
         int b = vis_b[fi] * 255 / 256;
         if (b < 8) continue;
-        // Die body color: cream white shaded by brightness
         int v = 200 + b / 4;
         if (v > 255) v = 255;
         uint16_t body_col = ((v>>3)<<11)|((v>>2)<<5)|(v>>3);
         draw_face(f, body_col);
         draw_dots_on_face(f, 0x0000);
+        outline_face(f, 0x0000);
     }
 
     // --- draw result number ---
