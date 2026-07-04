@@ -1,21 +1,14 @@
 #include <stdio.h>
+#include <string.h>
+#include <math.h>
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 #include "ili9341_8080.pio.h"
-#include "lvgl.h"
-#include "demos/widgets/lv_demo_widgets.h"
 
 //
 // RP2040 GPIO → ILI9341 pin map (8-bit 8080 parallel)
 //
-//  D0-D7  GP0-7   Pico 1,2,4,5,6,7,9,10    PIO OUT
-//  WR      GP8     Pico 11                   PIO SET (strobe)
-//  RD      GP9     Pico 12                   GPIO pull-high
-//  DC      GP10    Pico 14                   GPIO (1=data,0=cmd)
-//  CS      GP11    Pico 15                   GPIO held low
-//  RST     GP12    Pico 16                   GPIO
-
 #define DATA_BASE   0
 #define WR_PIN      8
 #define RD_PIN      9
@@ -31,39 +24,58 @@
 
 #define DMA_CHAN    0
 
-// ---------- globals ----------
+// ---------- framebuffer ----------
+
+static uint8_t fb[TFT_W * TFT_H * 2];   // (HI, LO) per pixel for 8-bit interface
 
 static uint program_offset;
 static dma_channel_config dma_cfg;
 
-// ---------- helpers ----------
+// ---------- display helpers ----------
 
 static inline void pio_put(uint8_t d) {
     pio_sm_put_blocking(DISPLAY_PIO, DISPLAY_SM, d);
 }
 
-static void write_cmd_sync(uint8_t cmd) {
+static void write_cmd(uint8_t cmd) {
     gpio_put(DC_PIN, 0);
     pio_put(cmd);
     while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
 }
 
-static void write_data_sync(uint8_t data) {
+static void write_data(uint8_t data) {
     gpio_put(DC_PIN, 1);
     pio_put(data);
 }
 
 static void set_addr_win(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
-    write_cmd_sync(0x2A);
-    write_data_sync(x0 >> 8); write_data_sync(x0 & 0xFF);
-    write_data_sync(x1 >> 8); write_data_sync(x1 & 0xFF);
-
-    write_cmd_sync(0x2B);
-    write_data_sync(y0 >> 8); write_data_sync(y0 & 0xFF);
-    write_data_sync(y1 >> 8); write_data_sync(y1 & 0xFF);
-
-    write_cmd_sync(0x2C);
+    write_cmd(0x2A);
+    write_data(x0 >> 8); write_data(x0 & 0xFF);
+    write_data(x1 >> 8); write_data(x1 & 0xFF);
+    write_cmd(0x2B);
+    write_data(y0 >> 8); write_data(y0 & 0xFF);
+    write_data(y1 >> 8); write_data(y1 & 0xFF);
+    write_cmd(0x2C);
     gpio_put(DC_PIN, 1);
+}
+
+static void flush_fb(void) {
+    set_addr_win(0, 0, TFT_W - 1, TFT_H - 1);
+    dma_channel_configure(
+        DMA_CHAN, &dma_cfg,
+        &pio0_hw->txf[DISPLAY_SM],
+        fb, sizeof(fb), true
+    );
+    while (dma_channel_is_busy(DMA_CHAN))
+        tight_loop_contents();
+    while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0)
+        tight_loop_contents();
+}
+
+static inline void set_px(int x, int y, uint16_t c) {
+    int i = (y * TFT_W + x) * 2;
+    fb[i]   = c >> 8;
+    fb[i+1] = c & 0xFF;
 }
 
 // ---------- ILI9341 init ----------
@@ -72,85 +84,229 @@ static void ili9341_init(void) {
     gpio_put(RST_PIN, 0); sleep_ms(10);
     gpio_put(RST_PIN, 1); sleep_ms(120);
 
-    write_cmd_sync(0x01); sleep_ms(120);
-    write_cmd_sync(0x28);
+    write_cmd(0x01); sleep_ms(120);
+    write_cmd(0x28);
 
-    write_cmd_sync(0xCB); write_data_sync(0x39); write_data_sync(0x2C);
-                           write_data_sync(0x00); write_data_sync(0x34);
-                           write_data_sync(0x02);
-    write_cmd_sync(0xCF); write_data_sync(0x00); write_data_sync(0xC1);
-                           write_data_sync(0x30);
-    write_cmd_sync(0xE8); write_data_sync(0x85); write_data_sync(0x00);
-                           write_data_sync(0x78);
-    write_cmd_sync(0xEA); write_data_sync(0x00); write_data_sync(0x00);
-    write_cmd_sync(0xED); write_data_sync(0x64); write_data_sync(0x03);
-                           write_data_sync(0x12); write_data_sync(0x81);
-    write_cmd_sync(0xF7); write_data_sync(0x20);
-    write_cmd_sync(0xC0); write_data_sync(0x23);
-    write_cmd_sync(0xC1); write_data_sync(0x10);
-    write_cmd_sync(0xC5); write_data_sync(0x3E); write_data_sync(0x28);
-    write_cmd_sync(0xC7); write_data_sync(0x86);
+    write_cmd(0xCB); write_data(0x39); write_data(0x2C);
+    write_data(0x00); write_data(0x34); write_data(0x02);
+    write_cmd(0xCF); write_data(0x00); write_data(0xC1); write_data(0x30);
+    write_cmd(0xE8); write_data(0x85); write_data(0x00); write_data(0x78);
+    write_cmd(0xEA); write_data(0x00); write_data(0x00);
+    write_cmd(0xED); write_data(0x64); write_data(0x03);
+    write_data(0x12); write_data(0x81);
+    write_cmd(0xF7); write_data(0x20);
+    write_cmd(0xC0); write_data(0x23);
+    write_cmd(0xC1); write_data(0x10);
+    write_cmd(0xC5); write_data(0x3E); write_data(0x28);
+    write_cmd(0xC7); write_data(0x86);
 
-    write_cmd_sync(0x36); write_data_sync(0x48);
-    write_cmd_sync(0x3A); write_data_sync(0x55);
-    write_cmd_sync(0xB1); write_data_sync(0x00); write_data_sync(0x18);
-    write_cmd_sync(0xB6); write_data_sync(0x08); write_data_sync(0x82);
-                           write_data_sync(0x27);
+    write_cmd(0x36); write_data(0x48);
+    write_cmd(0x3A); write_data(0x55);
+    write_cmd(0xB1); write_data(0x00); write_data(0x18);
+    write_cmd(0xB6); write_data(0x08); write_data(0x82); write_data(0x27);
 
-    write_cmd_sync(0xF2); write_data_sync(0x00);
-    write_cmd_sync(0x26); write_data_sync(0x01);
-    write_cmd_sync(0xE0); write_data_sync(0x0F); write_data_sync(0x31);
-                           write_data_sync(0x2B); write_data_sync(0x0C);
-                           write_data_sync(0x0E); write_data_sync(0x08);
-                           write_data_sync(0x4E); write_data_sync(0xF1);
-                           write_data_sync(0x37); write_data_sync(0x07);
-                           write_data_sync(0x10); write_data_sync(0x03);
-                           write_data_sync(0x0E); write_data_sync(0x09);
-                           write_data_sync(0x00);
-    write_cmd_sync(0xE1); write_data_sync(0x00); write_data_sync(0x0E);
-                           write_data_sync(0x14); write_data_sync(0x03);
-                           write_data_sync(0x11); write_data_sync(0x07);
-                           write_data_sync(0x31); write_data_sync(0xC1);
-                           write_data_sync(0x48); write_data_sync(0x08);
-                           write_data_sync(0x0F); write_data_sync(0x0C);
-                           write_data_sync(0x31); write_data_sync(0x36);
-                           write_data_sync(0x0F);
+    write_cmd(0xF2); write_data(0x00);
+    write_cmd(0x26); write_data(0x01);
+    write_cmd(0xE0); write_data(0x0F); write_data(0x31);
+    write_data(0x2B); write_data(0x0C); write_data(0x0E);
+    write_data(0x08); write_data(0x4E); write_data(0xF1);
+    write_data(0x37); write_data(0x07); write_data(0x10);
+    write_data(0x03); write_data(0x0E); write_data(0x09);
+    write_data(0x00);
+    write_cmd(0xE1); write_data(0x00); write_data(0x0E);
+    write_data(0x14); write_data(0x03); write_data(0x11);
+    write_data(0x07); write_data(0x31); write_data(0xC1);
+    write_data(0x48); write_data(0x08); write_data(0x0F);
+    write_data(0x0C); write_data(0x31); write_data(0x36);
+    write_data(0x0F);
 
-    write_cmd_sync(0x11); sleep_ms(120);
-    write_cmd_sync(0x29); sleep_ms(50);
+    write_cmd(0x11); sleep_ms(120);
+    write_cmd(0x29); sleep_ms(50);
 }
 
-// ---------- LVGL display driver ----------
+// ---------- 3D cube ----------
 
-static lv_color_t buf[LV_HOR_RES_MAX * 10];
+// Cube data ----------------------------------------------------------------
+// 8 vertices of a ±1 cube scaled by 120 for orthographic projection
+#define CUBE_SCALE 130
+static const int8_t cube_verts[8][3] = {
+    {-1,-1,-1}, { 1,-1,-1}, { 1, 1,-1}, {-1, 1,-1},
+    {-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1},
+};
 
-static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t n = lv_area_get_width(area) * lv_area_get_height(area);
+// 6 quad faces (vertex indices), base colors
+static const int8_t cube_faces[6][4] = {
+    {0,1,2,3},  {5,4,7,6},  {4,5,1,0},
+    {3,2,6,7},  {4,0,3,7},  {1,5,6,2},
+};
+static const uint16_t face_colors[6] = {
+    0xF800, 0x001F, 0x07E0, 0xFFE0, 0x07FF, 0xF81F,
+};
 
-    set_addr_win(area->x1, area->y1, area->x2, area->y2);
+// Face normals (pre-projection)
+static const int8_t face_norms[6][3] = {
+    { 0, 0,-1}, { 0, 0, 1}, { 0,-1, 0},
+    { 0, 1, 0}, {-1, 0, 0}, { 1, 0, 0},
+};
 
-    dma_channel_configure(
-        DMA_CHAN, &dma_cfg,
-        &pio0_hw->txf[DISPLAY_SM],
-        color_p, n * 2, true
-    );
+// Q16.16 fixed-point trig ------------------------------------------------
+#define TRIG_BITS 8
+#define TRIG_SIZE (1 << TRIG_BITS)
+static int32_t trig_tab[TRIG_SIZE];
 
-    while (dma_channel_is_busy(DMA_CHAN))
-        tight_loop_contents();
-
-    while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0)
-        tight_loop_contents();
-
-    lv_disp_flush_ready(drv);
+static void init_trig(void) {
+    for (int i = 0; i < TRIG_SIZE; i++) {
+        double a = 6.283185307179586 * i / TRIG_SIZE;
+        trig_tab[i] = (int32_t)(sin(a) * 65536.0);
+    }
 }
 
-// ---------- LVGL 5 ms tick ----------
+static inline int32_t fp_mul(int32_t a, int32_t b) {
+    return (int32_t)(((int64_t)a * b) >> 16);
+}
 
-static struct repeating_timer lvgl_tick;
+// State --------------------------------------------------------------------
+static int16_t sx[8], sy[8];
+static int8_t face_bright[6];
+static int32_t ang_x, ang_y;
 
-static bool tick_cb(struct repeating_timer *t) {
-    lv_tick_inc(5);
-    return true;
+#define CX (TFT_W / 2)
+#define CY (TFT_H / 2) + 10
+
+static void transform_cube(void) {
+    int ai = (ang_x >> (16 - TRIG_BITS)) & (TRIG_SIZE - 1);
+    int aj = (ai + TRIG_SIZE / 4) & (TRIG_SIZE - 1);
+    int32_t c_x = trig_tab[ai], s_x = trig_tab[aj];
+    ai = (ang_y >> (16 - TRIG_BITS)) & (TRIG_SIZE - 1);
+    aj = (ai + TRIG_SIZE / 4) & (TRIG_SIZE - 1);
+    int32_t c_y = trig_tab[ai], s_y = trig_tab[aj];
+
+    int32_t sc = CUBE_SCALE * 65536;
+
+    for (int i = 0; i < 8; i++) {
+        int32_t x = cube_verts[i][0] * sc;
+        int32_t y = cube_verts[i][1] * sc;
+        int32_t z = cube_verts[i][2] * sc;
+
+        // Rotate Y
+        int32_t rx = fp_mul(x, c_y) - fp_mul(z, s_y);
+        int32_t rz = fp_mul(x, s_y) + fp_mul(z, c_y);
+        x = rx; z = rz;
+        // Rotate X
+        int32_t ry = fp_mul(y, c_x) - fp_mul(z, s_x);
+        rz = fp_mul(y, s_x) + fp_mul(z, c_x);
+        y = ry; z = rz;
+
+        // Orthographic projection to screen
+        sx[i] = CX + (int16_t)(x >> 16);
+        sy[i] = CY + (int16_t)(y >> 16);
+    }
+
+    for (int f = 0; f < 6; f++) {
+        int32_t nx = face_norms[f][0] * 65536;
+        int32_t ny = face_norms[f][1] * 65536;
+        int32_t nz = face_norms[f][2] * 65536;
+
+        int32_t rnx = fp_mul(nx, c_y) - fp_mul(nz, s_y);
+        int32_t rnz = fp_mul(nx, s_y) + fp_mul(nz, c_y);
+        nx = rnx; nz = rnz;
+        int32_t rny = fp_mul(ny, c_x) - fp_mul(nz, s_x);
+        rnz = fp_mul(ny, s_x) + fp_mul(nz, c_x);
+        ny = rny; nz = rnz;
+
+        // light from above-right
+        int32_t dot = fp_mul(nx, 32768) + fp_mul(ny, 32768) + nz;
+        if (dot < 0) dot = 0;
+        if (dot > 65536) dot = 65536;
+        face_bright[f] = (int8_t)(dot >> 8);
+    }
+}
+
+static void draw_span(int y, int x0, int x1, int r, int g, int b) {
+    if (y < 0 || y >= TFT_H) return;
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (x0 < 0) x0 = 0;
+    if (x1 >= TFT_W) x1 = TFT_W - 1;
+    if (x0 > x1) return;
+
+    uint16_t c = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    uint8_t hi = c >> 8, lo = c & 0xFF;
+    int base = y * TFT_W * 2 + x0 * 2;
+    for (int x = x0; x <= x1; x++) {
+        fb[base]     = hi;
+        fb[base + 1] = lo;
+        base += 2;
+    }
+}
+
+static void draw_face(int f) {
+    int b = face_bright[f];
+    if (b <= 0) return;
+
+    uint16_t base = face_colors[f];
+    int r = ((base >> 11) & 0x1F) * b / 255;
+    int g = ((base >> 5)  & 0x3F) * b / 255;
+    int bv = (base & 0x1F) * b / 255;
+
+    // Get screen coords of 4 vertices
+    int px[4], py[4];
+    for (int i = 0; i < 4; i++) {
+        int vi = cube_faces[f][i];
+        px[i] = sx[vi];
+        py[i] = sy[vi];
+    }
+
+    // Split quad into 2 triangles: (0,1,2) and (0,2,3)
+    for (int tri = 0; tri < 2; tri++) {
+        int v0i, v1i, v2i;
+        if (tri == 0) { v0i = 0; v1i = 1; v2i = 2; }
+        else           { v0i = 0; v1i = 2; v2i = 3; }
+
+        int vx[3] = {px[v0i], px[v1i], px[v2i]};
+        int vy[3] = {py[v0i], py[v1i], py[v2i]};
+
+        // Sort vertices by Y (bubble sort 3 elements)
+        for (int k = 0; k < 2; k++) {
+            for (int j = 0; j < 2 - k; j++) {
+                if (vy[j] > vy[j+1]) {
+                    int t = vx[j]; vx[j] = vx[j+1]; vx[j+1] = t;
+                    t = vy[j]; vy[j] = vy[j+1]; vy[j+1] = t;
+                }
+            }
+        }
+
+        int y0 = vy[0], y1 = vy[1], y2 = vy[2];
+        if (y0 == y2) return; // degenerate
+        if (y0 < 0) y0 = 0;
+        if (y2 >= TFT_H) y2 = TFT_H - 1;
+        if (y0 > y2) return;
+
+        // Scanline fill using fixed-point edge walking
+        int dx_l = (vx[2] - vx[0]) * 65536 / (vy[2] - vy[0] + 1);
+        int x_l  = vx[0] * 65536;
+
+        for (int y = y0; y <= y2; y++) {
+            int x_r;
+            if (y <= y1 && vy[1] > vy[0]) {
+                int dx_r = (vx[1] - vx[0]) * 65536 / (vy[1] - vy[0]);
+                x_r = vx[0] * 65536 + dx_r * (y - vy[0]);
+            } else if (vy[2] > vy[1]) {
+                int dx_r = (vx[2] - vx[1]) * 65536 / (vy[2] - vy[1]);
+                x_r = vx[1] * 65536 + dx_r * (y - vy[1]);
+            } else {
+                x_r = vx[2] * 65536;
+            }
+            draw_span(y, x_l >> 16, x_r >> 16, r, g, bv);
+            x_l += dx_l;
+        }
+    }
+}
+
+static void render_frame(void) {
+    memset(fb, 0, sizeof(fb));          // clear to black
+    transform_cube();
+    for (int f = 0; f < 6; f++)
+        draw_face(f);
 }
 
 // ---------- main ----------
@@ -159,80 +315,60 @@ int main(void) {
     stdio_init_all();
     sleep_ms(100);
 
-    // ---- PIO ----
+    // PIO
     program_offset = pio_add_program(DISPLAY_PIO, &ili9341_8080_program);
     ili9341_8080_program_init(DISPLAY_PIO, DISPLAY_SM, program_offset, DATA_BASE, WR_PIN);
     gpio_put(WR_PIN, 1);
     pio_sm_set_enabled(DISPLAY_PIO, DISPLAY_SM, true);
 
-    // ---- GPIO control ----
+    // GPIO
     gpio_init(RD_PIN);   gpio_set_dir(RD_PIN, GPIO_OUT);   gpio_put(RD_PIN, 1);
     gpio_init(DC_PIN);   gpio_set_dir(DC_PIN, GPIO_OUT);   gpio_put(DC_PIN, 0);
     gpio_init(CS_PIN);   gpio_set_dir(CS_PIN, GPIO_OUT);   gpio_put(CS_PIN, 0);
     gpio_init(RST_PIN);  gpio_set_dir(RST_PIN, GPIO_OUT);  gpio_put(RST_PIN, 1);
-    gpio_init(25);       gpio_set_dir(25, GPIO_OUT);       gpio_put(25, 0);
 
-    // ---- DMA ----
+    // DMA
     dma_cfg = dma_channel_get_default_config(DMA_CHAN);
     channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&dma_cfg, true);
     channel_config_set_write_increment(&dma_cfg, false);
     channel_config_set_dreq(&dma_cfg, pio_get_dreq(DISPLAY_PIO, DISPLAY_SM, true));
+    dma_channel_configure(DMA_CHAN, &dma_cfg, &pio0_hw->txf[DISPLAY_SM], NULL, 0, false);
 
-    dma_channel_configure(
-        DMA_CHAN, &dma_cfg,
-        &pio0_hw->txf[DISPLAY_SM],
-        NULL, 0, false
-    );
-
-    // ---- Display ----
+    // Display
     ili9341_init();
+    init_trig();
 
-    // ---- Test: CPU-driven rectangle ----
+    // Show CPU-driven test rect
     {
         gpio_put(DC_PIN, 0);
         pio_put(0x2A); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
         gpio_put(DC_PIN, 1);
-        pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
+        for (int i = 0; i < 4; i++) { pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0); }
         pio_put(99); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
         gpio_put(DC_PIN, 0);
         pio_put(0x2B); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
         gpio_put(DC_PIN, 1);
-        pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
+        for (int i = 0; i < 4; i++) { pio_put(0); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0); }
         pio_put(99); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
         gpio_put(DC_PIN, 0);
         pio_put(0x2C); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
         gpio_put(DC_PIN, 1);
         for (int px = 0; px < 100 * 100; px++) {
-            pio_put(0xF8);
-            pio_put(0x00);
+            pio_put(0xF8); pio_put(0x00);
         }
         while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
     }
 
-    // ---- LVGL ----
-    lv_init();
-
-    lv_disp_drv_t drv;
-    lv_disp_drv_init(&drv);
-    drv.hor_res  = TFT_W;
-    drv.ver_res  = TFT_H;
-    drv.flush_cb = disp_flush;
-    static lv_disp_draw_buf_t draw_buf;
-    lv_disp_draw_buf_init(&draw_buf, buf, NULL, sizeof(buf) / sizeof(lv_color_t));
-    drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&drv);
-
-    add_repeating_timer_ms(5, tick_cb, NULL, &lvgl_tick);
-
-    lv_demo_widgets();
+    ang_x = 0;
+    ang_y = 0;
 
     for (;;) {
-        lv_timer_handler();
-        sleep_ms(1);
+        render_frame();
+        flush_fb();
+        ang_x += 786;  // ~0.012 rad per frame in Q16.16
+        ang_y += 524;
+        gpio_put(25, 1);
+        gpio_put(25, 0);
     }
 }
