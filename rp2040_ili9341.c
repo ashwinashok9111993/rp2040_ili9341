@@ -213,7 +213,7 @@ int main(void) {
     channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
     channel_config_set_read_increment(&dma_cfg, true);
     channel_config_set_write_increment(&dma_cfg, false);
-    channel_config_set_dreq(&dma_cfg, pio_get_dreq(DISPLAY_PIO, DISPLAY_SM, false));
+    channel_config_set_dreq(&dma_cfg, pio_get_dreq(DISPLAY_PIO, DISPLAY_SM, true));
 
     dma_channel_configure(
         DMA_CHAN, &dma_cfg,
