@@ -74,12 +74,14 @@ static void set_addr_win(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
 static void dma_irq_handler(void) {
     if (dma_hw->ints0 & (1u << DMA_CHAN)) {
         dma_hw->ints0 = (1u << DMA_CHAN);
+        gpio_put(25, 1);
         while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0)
             tight_loop_contents();
         for (volatile int i = 0; i < 8; i++)
             tight_loop_contents();
         ili9341_8080_switch_byte(DISPLAY_PIO, DISPLAY_SM, program_offset);
         lv_disp_flush_ready(disp_drv_ref);
+        gpio_put(25, 0);
     }
 }
 
@@ -168,7 +170,6 @@ static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *co
     }
 
     disp_drv_ref = drv;
-    printf("  flush %d pix (%dx%d) -> %d dma_words\n", n, w, h, dma_words);
 
     ili9341_8080_switch_dma(DISPLAY_PIO, DISPLAY_SM, program_offset);
     dma_channel_abort(DMA_CHAN);
@@ -193,7 +194,6 @@ static bool tick_cb(struct repeating_timer *t) {
 int main(void) {
     stdio_init_all();
     sleep_ms(100);
-    printf("ILI9341 + LVGL + DMA\n");
 
     // ---- PIO ----
     program_offset = pio_add_program(DISPLAY_PIO, &ili9341_8080_program);
@@ -206,6 +206,7 @@ int main(void) {
     gpio_init(DC_PIN);   gpio_set_dir(DC_PIN, GPIO_OUT);   gpio_put(DC_PIN, 0);
     gpio_init(CS_PIN);   gpio_set_dir(CS_PIN, GPIO_OUT);   gpio_put(CS_PIN, 0);
     gpio_init(RST_PIN);  gpio_set_dir(RST_PIN, GPIO_OUT);  gpio_put(RST_PIN, 1);
+    gpio_init(25);       gpio_set_dir(25, GPIO_OUT);       gpio_put(25, 0);
 
     // ---- DMA ----
     dma_cfg = dma_channel_get_default_config(DMA_CHAN);
@@ -220,17 +221,15 @@ int main(void) {
         NULL, 0, false
     );
 
-    dma_hw->ints0 = (1u << DMA_CHAN);  // clear any stray IRQ
+    dma_hw->ints0 = (1u << DMA_CHAN);
     dma_channel_set_irq0_enabled(DMA_CHAN, true);
     irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 
     // ---- Display ----
     ili9341_init();
-    printf("ILI9341 ready\n");
 
     // ---- Test: CPU-driven rectangle ----
-    printf("Drawing test rectangle...\n");
     {
         gpio_put(DC_PIN, 0);
         pio_put(0x2A); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
@@ -250,11 +249,10 @@ int main(void) {
         pio_put(0x2C); while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
         gpio_put(DC_PIN, 1);
         for (int px = 0; px < 100 * 100; px++) {
-            pio_put(0xF8);  // R high bits
-            pio_put(0x00);  // G=0, B=0
+            pio_put(0xF8);
+            pio_put(0x00);
         }
         while (pio_sm_get_tx_fifo_level(DISPLAY_PIO, DISPLAY_SM) > 0);
-        printf("Test rectangle done\n");
     }
 
     // ---- LVGL ----
@@ -272,7 +270,6 @@ int main(void) {
 
     add_repeating_timer_ms(5, tick_cb, NULL, &lvgl_tick);
 
-    printf("Starting LVGL widget demo\n");
     lv_demo_widgets();
 
     for (;;) {

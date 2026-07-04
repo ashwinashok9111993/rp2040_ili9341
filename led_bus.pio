@@ -1,0 +1,61 @@
+;
+; PIO program to drive an 8-bit LED bus on consecutive GPIO pins.
+; Bit 7 of the uint8 value goes to the base pin (MSB), bit 0 to base+7 (LSB).
+;
+
+.program led_bus
+    pull block          ; Blocking pull 32-bit word from TX FIFO into OSR
+    out pins, 8         ; Write lower 8 bits of OSR to 8 consecutive OUT pins
+
+% c-sdk {
+
+#include "hardware/pio.h"
+
+/*
+ * Bit-reverse an 8-bit value so that in the PIO `out pins, 8` mapping
+ * (bit 0 -> base pin, bit 7 -> base+7) the caller can present uint8 bit 7
+ * as the MSB on the base pin and bit 0 as the LSB on base+7.
+ *
+ * Example: GPIO6 = base = MSB position, GPIO13 = base+7 = LSB position.
+ */
+static inline uint8_t led_bus_reverse_u8(uint8_t b) {
+    b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+    b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+    b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+    return b;
+}
+
+/*
+ * Initialise a PIO state machine to drive 8 consecutive GPIO pins as
+ * outputs, starting at `base_pin`. `offset` is the PIO program offset
+ * returned by pio_add_program().
+ *
+ * After this call, pio_sm_set_enabled() can be used to start the SM.
+ */
+static inline void led_bus_program_init(PIO pio, uint sm, uint offset, uint base_pin) {
+    // Mark all 8 pins as outputs in the GPIO pad
+    for (int i = 0; i < 8; i++) {
+        pio_gpio_init(pio, base_pin + i);
+    }
+    pio_sm_set_consecutive_pindirs(pio, sm, base_pin, 8, true);
+
+    // Configure OUT instruction mapping: base_pin, 8 pins wide
+    pio_sm_config c = led_bus_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, base_pin, 8);
+
+    // Initialise the state machine (but do not start it yet)
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+/*
+ * Send an 8-bit value to the LED bus via the given PIO state machine.
+ * The value is bit-reversed before being pushed so that the physical pin
+ * order reflects logical significance (MSB on base_pin, LSB on base_pin+7).
+ *
+ * This function blocks until the FIFO has room.
+ */
+static inline void led_bus_send(PIO pio, uint sm, uint8_t value) {
+    pio_sm_put_blocking(pio, sm, led_bus_reverse_u8(value));
+}
+
+%}
