@@ -1,32 +1,35 @@
-# AGENTS.md — RP2040 ILI9341 LVGL DMA
+# AGENTS.md — RP2040 ILI9341 PIO DMA
 
 ## Purpose
-Boost framerate on RP2040 Pico driving ILI9341 (MAR2406) display via 8-bit parallel 8080 interface using PIO + DMA.
+Drive ILI9341 (MAR2406) display via 8-bit parallel 8080 interface using PIO + DMA. Current demo: rolling dice with physics animation.
 
-## Status
-- PIO byte-mode works (test rectangle visible via CPU-driven writes).
-- **Synchronous DMA works** — `disp_flush` packs 2 pixels/uint32_t into `swap_buf[]`, starts DMA, busy-waits for completion, drains FIFO+OSR, switches to byte mode, calls `flush_ready`. No ISR.
+## Architecture
+- PIO0 SM0: single byte-mode program (pull block → out pins,8 → WR strobe). No dma_mode, no autopull.
+- DMA channel 0: `DMA_SIZE_8` with TX DREQ, reads directly from framebuffer `fb[]`.
+- Synchronous flush: `dma_channel_configure` → busy-wait → FIFO drain → done.
+- LVGL not linked in current builds (cube/dice demos use raw framebuffer).
 
-## Current Architecture
-- PIO0 SM0 runs `ili9341_8080.pio` program with two sections:
-  - **byte_mode** (wrap 0-3): `pull block → out 8 → WR strobe`. Used for init/commands.
-  - **dma_mode** (4-16): `out 8 → WR strobe` × 4 per autopulled word. Used for pixel data.
-- Mode switching via `pio_sm_restart` + `pio_sm_exec(jmp)`.
-- DMA channel 0 transfers from `swap_buf[]` to PIO TX FIFO (synchronous: busy-wait in `disp_flush`).
-- No ISR. Flush is synchronous: DMA starts → busy-wait → drain → switch byte → `flush_ready`.
-- Swap buffer packs 2× RGB565 pixels per uint32_t in HI0,LO0,HI1,LO1 byte order.
+## Branches
+- `master` — LVGL widget demo baseline.
+- `cube-3d` — flat-shaded rotating cube (orthographic, Q16.16 fixed-point).
+- `dice-demo` (current) — rolling 3D die with dot faces, 3-state animation.
+
+## Dice Demo
+- 3 states: `ROLL` (fast spin, ~80 frames), `SETTLE` (decelerate), `SHOW` (~150 frames).
+- Random initial velocity with perturbation and damping.
+- Standard die dot patterns (1–6), bilinear interpolated on projected face quads.
+- Result digit drawn at bottom of screen when settled (5×7 font, 8x scaled).
+- Body: cream white with Lambertian shading; dots: black.
 
 ## Key Files
-- `ili9341_8080.pio` — PIO program (byte + dma modes), init & switch helpers
-- `rp2040_ili9341.c` — main: ILI9341 init, LVGL glue, DMA setup, synchronous flush
-- `CMakeLists.txt` — builds LVGL v8.4.0 with widget demo
+- `ili9341_8080.pio` — single byte-mode PIO program
+- `rp2040_ili9341.c` — main: ILI9341 init, DMA setup, dice renderer
+- `CMakeLists.txt` — builds with LVGL v8.4.0 (unused in dice build)
 - `lv_conf.h` — LVGL config
 
-## Debugging
-- Red 100×100 rect drawn via CPU byte-mode BEFORE LVGL starts → confirms byte-mode PIO works.
-- LVGL flush calls synchronous DMA (busy-wait) — works correctly.
-- Earlier async DMA (ISR-based) caused horizontal stripes. Root cause: `dma_channel_configure` clears IRQ enable (`INTE`) on each call, AND async `flush_ready` from ISR races with LVGL single-buffer render.
-- Fix: synchronous DMA — no ISR, poll `dma_channel_is_busy` in `disp_flush`, drain, switch byte, `flush_ready`.
+## PIO timing (125 MHz)
+- 4 instructions, `[1]` delay on WR edges (16ns meets ILI9341 15ns min).
+- 6 cycles/byte = 48ns. Full frame flush: 153600 bytes × 48ns ≈ 7.4ms.
 
 ## Build
 ```bash
@@ -37,12 +40,12 @@ Output: `rp2040_ili9341.uf2`
 ## Pin Map
 | Function | GPIO | Pico Pin |
 |----------|------|----------|
-| D0-D7    | 0-7  | 1,2,4,5,6,7,9,10 |
-| WR       | 8    | 11 |
-| RD       | 9    | 12 |
-| DC       | 10   | 14 |
-| CS       | 11   | 15 |
-| RST      | 12   | 16 |
+| D0-D7    | 0-7  | 1,2,4,6,7,9,10,11 |
+| WR       | 8    | 12 |
+| RD       | 9    | 14 |
+| DC       | 10   | 15 |
+| CS       | 11   | 16 |
+| RST      | 12   | 17 |
 
 ## Display
 LCD Wiki MAR2406 (QD243701 panel + TSC2046 touch). Touch not used.
