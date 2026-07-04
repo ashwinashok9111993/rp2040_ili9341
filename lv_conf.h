@@ -27,7 +27,7 @@
 
 #define LV_USE_PERF_MONITOR   1
 
-#define LV_DISP_DEF_REFR_PERIOD   16
+#define LV_DISP_DEF_REFR_PERIOD   12
 
 #define LV_USE_DEMO_WIDGETS   1
 
